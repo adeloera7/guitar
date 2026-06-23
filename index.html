@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>Chord Changes</title>
+
+<!-- iOS Home Screen / PWA -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Chord Changes" />
+<meta name="theme-color" content="#0d0d0d" />
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Crect width='180' height='180' fill='%230d0d0d'/%3E%3Ctext x='90' y='118' font-size='90' text-anchor='middle' fill='%23c8b97a' font-family='monospace' font-weight='bold'%3E%E2%99%AA%3C/text%3E%3C/svg%3E" />
+
+<style>
+  * { -webkit-tap-highlight-color: transparent; box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #0d0d0d; }
+  body { font-family: 'Courier New', monospace; }
+  /* Honor the iOS safe areas when launched fullscreen */
+  #root { padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+  input[type=number]::-webkit-inner-spin-button { opacity: 1; }
+</style>
+
+<!-- React + Babel via CDN — no build step needed -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+const CHORDS = ["A", "Am", "B", "Bm", "C", "D", "Dm", "E", "Em", "F", "G", "Gm"];
+const DURATION = 60;
+const COUNTDOWN = 3;
+const STORE_KEY = "guitar-chord-history";
+
+/* ---------------------------------------------------------------
+   DURABLE STORAGE
+   Primary: IndexedDB (survives Home-Screen launches; not wiped like
+   an iframe sandbox). Mirror: localStorage. On every save we also keep
+   an in-memory + localStorage backup so a single layer failing never
+   loses data.
+----------------------------------------------------------------*/
+const DB_NAME = "chordTrackerDB";
+const DB_STORE = "kv";
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    try {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE);
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    } catch (e) { reject(e); }
+  });
+}
+
+async function idbGet(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readonly");
+    const req = tx.objectStore(DB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbSet(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, "readwrite");
+    tx.objectStore(DB_STORE).put(value, key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
+async function loadHistory() {
+  // Try IndexedDB first
+  try {
+    const v = await idbGet(STORE_KEY);
+    if (v) {
+      const parsed = typeof v === "string" ? JSON.parse(v) : v;
+      if (Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  // Fall back to localStorage and migrate it into IndexedDB
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        try { await idbSet(STORE_KEY, raw); } catch {}
+        return parsed;
+      }
+    }
+  } catch {}
+  return [];
+}
+
+async function saveHistory(history) {
+  const serialized = JSON.stringify(history);
+  let ok = false;
+  try { ok = await idbSet(STORE_KEY, serialized); } catch {}
+  try { localStorage.setItem(STORE_KEY, serialized); } catch {}
+  return ok;
+}
+
+/* ---------------- Chord pair helpers ---------------- */
+function samePair(e, a, b) {
+  return (e.from === a && e.to === b) || (e.from === b && e.to === a);
+}
+
+/* ---------------- Audio ---------------- */
+let audioCtx = null;
+let scheduledOscillators = [];
+
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+function scheduleSession(countdown, duration) {
+  try {
+    const ctx = getAudioCtx();
+    if (ctx.state === "suspended") ctx.resume();
+    const buf = ctx.createBuffer(1, 1, 22050);
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.connect(ctx.destination); src.start(0);
+
+    cancelBell();
+    const now = ctx.currentTime;
+    const beep = (t, freq, vol, dur) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = freq; osc.type = "sine";
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(vol, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+      osc.start(t); osc.stop(t + dur);
+      scheduledOscillators.push(osc);
+    };
+    for (let i = 0; i < countdown; i++) beep(now + i, 660, 0.35, 0.18);
+    const goT = now + countdown;
+    beep(goT, 1320, 0.55, 0.35);
+    const base = goT + duration;
+    for (let rep = 0; rep < 3; rep++) {
+      [880, 1100].forEach((freq, i) => beep(base + rep * 0.5 + i * 0.18, freq, 0.6, 0.4));
+    }
+  } catch {}
+}
+
+function cancelBell() {
+  scheduledOscillators.forEach(o => { try { o.stop(); } catch {} });
+  scheduledOscillators = [];
+}
+
+function playCheer() {
+  try {
+    const ctx = getAudioCtx();
+    if (ctx.state === "suspended") ctx.resume();
+    [523, 659, 784, 1047, 1319].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.frequency.value = freq; osc.type = "triangle";
+      const t = ctx.currentTime + i * 0.12;
+      gain.gain.setValueAtTime(0, t);
+      gain.gain.linearRampToValueAtTime(0.5, t + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, t + 0.5);
+      osc.start(t); osc.stop(t + 0.5);
+    });
+  } catch {}
+}
+
+/* ---------------- App ---------------- */
+function ChordTracker() {
+  const [history, setHistory] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [fromChord, setFromChord] = useState("A");
+  const [toChord, setToChord] = useState("G");
+  const [timeLeft, setTimeLeft] = useState(DURATION);
+  const [running, setRunning] = useState(false);
+  const [phase, setPhase] = useState("idle");
+  const [countdownLeft, setCountdownLeft] = useState(COUNTDOWN);
+  const [finished, setFinished] = useState(false);
+  const [inputCount, setInputCount] = useState("");
+  const [view, setView] = useState("tracker");
+  const [flash, setFlash] = useState(false);
+  const [celebrate, setCelebrate] = useState(null);
+  const [saveState, setSaveState] = useState("—");
+  const intervalRef = useRef(null);
+  const endTimeRef = useRef(null);
+  const finishedRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const data = await loadHistory();
+      if (!cancelled) {
+        setHistory(Array.isArray(data) ? data : []);
+        setLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (loaded) {
+      saveHistory(history).then(ok =>
+        setSaveState(ok ? "saved " + new Date().toLocaleTimeString() : "localStorage only"));
+    }
+  }, [history, loaded]);
+
+  useEffect(() => {
+    if (phase === "countdown") {
+      const cdEnd = Date.now() + COUNTDOWN * 1000;
+      intervalRef.current = setInterval(() => {
+        const rem = Math.ceil((cdEnd - Date.now()) / 1000);
+        if (rem <= 0) { clearInterval(intervalRef.current); setCountdownLeft(0); setPhase("running"); }
+        else setCountdownLeft(rem);
+      }, 100);
+    } else if (phase === "running") {
+      finishedRef.current = false;
+      setRunning(true);
+      endTimeRef.current = Date.now() + DURATION * 1000;
+      intervalRef.current = setInterval(() => {
+        const remaining = Math.ceil((endTimeRef.current - Date.now()) / 1000);
+        if (remaining <= 0) {
+          clearInterval(intervalRef.current);
+          setTimeLeft(0); setRunning(false); setPhase("idle"); setFinished(true);
+          if (!finishedRef.current) {
+            finishedRef.current = true;
+            setFlash(true);
+            setTimeout(() => setFlash(false), 1200);
+          }
+        } else setTimeLeft(remaining);
+      }, 200);
+    }
+    return () => clearInterval(intervalRef.current);
+  }, [phase]);
+
+  function start() {
+    scheduleSession(COUNTDOWN, DURATION);
+    setTimeLeft(DURATION);
+    setCountdownLeft(COUNTDOWN);
+    setFinished(false);
+    setInputCount("");
+    setPhase("countdown");
+  }
+
+  function save() {
+    const count = parseInt(inputCount, 10);
+    if (isNaN(count) || count < 0) return;
+    const priorForPair = history.filter(e => samePair(e, fromChord, toChord));
+    const prevBest = priorForPair.length ? Math.max(...priorForPair.map(e => e.count)) : null;
+    const isRecord = priorForPair.length > 0 && count > prevBest;
+    const entry = { id: Date.now(), date: new Date().toISOString(), from: fromChord, to: toChord, count };
+    setHistory([entry, ...history]);
+    setFinished(false);
+    setInputCount("");
+    setTimeLeft(DURATION);
+    if (isRecord) {
+      playCheer();
+      setCelebrate({ count, prev: prevBest, from: fromChord, to: toChord });
+    }
+  }
+
+  function discard() {
+    setFinished(false);
+    setInputCount("");
+    setTimeLeft(DURATION);
+  }
+
+  function deleteEntry(id) {
+    setHistory(history.filter(e => e.id !== id));
+  }
+
+  function exportJSON() {
+    const blob = new Blob([JSON.stringify(history, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "chord-changes.json"; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function importJSON(e) {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const imported = JSON.parse(reader.result);
+        if (!Array.isArray(imported)) throw new Error("bad");
+        const byId = new Map();
+        [...history, ...imported].forEach(en => { if (en && en.id) byId.set(en.id, en); });
+        setHistory(Array.from(byId.values()).sort((a, b) => b.id - a.id));
+      } catch {
+        alert("Couldn't read that file — make sure it's an exported chord-changes.json.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }
+
+  const pct = phase === "countdown" ? (countdownLeft / COUNTDOWN) * 100 : (timeLeft / DURATION) * 100;
+  const radius = 54;
+  const circ = 2 * Math.PI * radius;
+  const dash = (pct / 100) * circ;
+
+  const pairHistory = history.filter(e => samePair(e, fromChord, toChord));
+  const best = pairHistory.length ? Math.max(...pairHistory.map(e => e.count)) : null;
+
+  const parsedInput = parseInt(inputCount, 10);
+  const validInput = !isNaN(parsedInput) && parsedInput >= 0;
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: flash ? "#f0ece3" : "#0d0d0d",
+      transition: "background 0.1s", color: "#f0ece3",
+      fontFamily: "'Courier New', monospace",
+      display: "flex", flexDirection: "column", alignItems: "center",
+      padding: "2rem 1rem",
+    }}>
+      {celebrate && <CelebrationOverlay data={celebrate} onClose={() => setCelebrate(null)} />}
+
+      <div style={{ width: "100%", maxWidth: 480, marginBottom: "2rem" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+          <div>
+            <div style={{ fontSize: "0.65rem", letterSpacing: "0.3em", color: "#888", textTransform: "uppercase", marginBottom: 4 }}>One Minute</div>
+            <h1 style={{ margin: 0, fontSize: "1.8rem", fontWeight: 700, letterSpacing: "-0.03em", color: "#f0ece3" }}>Chord Changes</h1>
+          </div>
+          <div style={{ display: "flex", gap: "0.5rem" }}>
+            {["tracker", "history"].map(v => (
+              <button key={v} onClick={() => setView(v)} style={{
+                background: view === v ? "#f0ece3" : "transparent",
+                color: view === v ? "#0d0d0d" : "#666",
+                border: "1px solid " + (view === v ? "#f0ece3" : "#333"),
+                borderRadius: 4, padding: "4px 12px", fontSize: "0.7rem",
+                letterSpacing: "0.15em", textTransform: "uppercase", cursor: "pointer",
+              }}>{v}</button>
+            ))}
+          </div>
+        </div>
+        <div style={{ height: 1, background: "#222", marginTop: "1rem" }} />
+      </div>
+
+      {view === "tracker" ? (
+        <div style={{ width: "100%", maxWidth: 480 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: "1rem", marginBottom: "2rem", justifyContent: "center" }}>
+            <ChordPicker label="FROM" value={fromChord} onChange={setFromChord} disabled={phase !== "idle"} />
+            <div style={{ color: "#555", fontSize: "1.2rem", marginTop: 20 }}>→</div>
+            <ChordPicker label="TO" value={toChord} onChange={setToChord} disabled={phase !== "idle"} />
+          </div>
+
+          {best !== null && (
+            <div style={{ textAlign: "center", marginBottom: "1.5rem", fontSize: "0.72rem", color: "#666", letterSpacing: "0.15em" }}>
+              BEST: <span style={{ color: "#c8b97a" }}>{best}</span> changes · {pairHistory.length} session{pairHistory.length !== 1 ? "s" : ""}
+            </div>
+          )}
+
+          <div style={{ display: "flex", justifyContent: "center", marginBottom: "2rem" }}>
+            <div style={{ position: "relative", width: 140, height: 140 }}>
+              <svg width={140} height={140} style={{ transform: "rotate(-90deg)" }}>
+                <circle cx={70} cy={70} r={radius} fill="none" stroke="#1e1e1e" strokeWidth={6} />
+                <circle cx={70} cy={70} r={radius} fill="none"
+                  stroke={finished ? "#c8b97a" : phase === "countdown" ? "#d98c5f" : running ? "#e05a5a" : "#3a3a3a"}
+                  strokeWidth={6} strokeDasharray={`${dash} ${circ}`} strokeLinecap="round"
+                  style={{ transition: "stroke-dasharray 0.4s ease, stroke 0.3s" }} />
+              </svg>
+              <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center" }}>
+                <div style={{
+                  fontSize: phase === "countdown" ? "3.2rem" : "2.2rem",
+                  fontWeight: 700, letterSpacing: "-0.04em", lineHeight: 1,
+                  color: phase === "countdown" ? "#d98c5f" : "#f0ece3",
+                }}>
+                  {finished ? "✓" : phase === "countdown" ? countdownLeft : timeLeft}
+                </div>
+                <div style={{ fontSize: "0.6rem", color: "#555", letterSpacing: "0.2em", marginTop: 2 }}>
+                  {finished ? "DONE" : phase === "countdown" ? "GET READY" : "SEC"}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {phase === "idle" && !finished && (
+            <button onClick={start} style={btnStyle("#e05a5a", "#fff")}>START TIMER</button>
+          )}
+
+          {phase === "countdown" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+              <div style={{ textAlign: "center", color: "#d98c5f", fontSize: "0.75rem", letterSpacing: "0.2em" }}>
+                STARTING IN {countdownLeft}…
+              </div>
+              <button onClick={() => { cancelBell(); clearInterval(intervalRef.current); setPhase("idle"); setTimeLeft(DURATION); setCountdownLeft(COUNTDOWN); }}
+                style={{ ...btnStyle("transparent", "#555"), border: "1px solid #333", fontSize: "0.7rem" }}>CANCEL</button>
+            </div>
+          )}
+
+          {running && (
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+              <div style={{ textAlign: "center", color: "#444", fontSize: "0.75rem", letterSpacing: "0.2em" }}>PLAYING — KEEP GOING…</div>
+              <button onClick={() => { cancelBell(); clearInterval(intervalRef.current); setRunning(false); setPhase("idle"); setTimeLeft(DURATION); }}
+                style={{ ...btnStyle("transparent", "#555"), border: "1px solid #333", fontSize: "0.7rem" }}>CANCEL</button>
+            </div>
+          )}
+
+          {finished && (
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+              <div style={{ textAlign: "center", fontSize: "0.7rem", color: "#c8b97a", letterSpacing: "0.2em", marginBottom: "0.25rem" }}>
+                TIME'S UP · {fromChord} → {toChord}
+              </div>
+              <div style={{ textAlign: "center", fontSize: "0.7rem", color: "#888", letterSpacing: "0.15em", marginBottom: "0.25rem" }}>
+                HOW MANY CHANGES DID YOU MAKE?
+              </div>
+              <input type="number" min="0" value={inputCount} onChange={e => setInputCount(e.target.value)}
+                placeholder="0" autoFocus
+                style={{
+                  background: "#111", color: "#f0ece3", border: "1px solid #444",
+                  borderRadius: 6, padding: "0.75rem", fontSize: "2rem", fontWeight: 700,
+                  fontFamily: "'Courier New', monospace", textAlign: "center", width: "100%",
+                  boxSizing: "border-box", outline: "none",
+                }}
+                onKeyDown={e => { if (e.key === "Enter" && validInput) save(); }} />
+              <button onClick={save} disabled={!validInput} style={{ ...btnStyle("#c8b97a", "#0d0d0d"), opacity: validInput ? 1 : 0.35 }}>SAVE SESSION</button>
+              <button onClick={discard} style={{ ...btnStyle("transparent", "#555"), border: "1px solid #333", fontSize: "0.7rem" }}>DISCARD</button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div style={{ width: "100%", maxWidth: 480 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+            <div style={{ fontSize: "0.65rem", letterSpacing: "0.25em", color: "#666", textTransform: "uppercase" }}>
+              {history.length} session{history.length !== 1 ? "s" : ""}
+            </div>
+            <div style={{ display: "flex", gap: "0.5rem" }}>
+              <label style={{ ...btnStyle("transparent", "#6ab0a0"), border: "1px solid #6ab0a0", fontSize: "0.65rem", padding: "4px 12px", display: "inline-block", width: "auto" }}>
+                IMPORT
+                <input type="file" accept="application/json,.json" onChange={importJSON} style={{ display: "none" }} />
+              </label>
+              {history.length > 0 && (
+                <button onClick={exportJSON} style={{ ...btnStyle("transparent", "#c8b97a"), border: "1px solid #c8b97a", fontSize: "0.65rem", padding: "4px 12px", width: "auto" }}>EXPORT</button>
+              )}
+            </div>
+          </div>
+
+          <div style={{ fontSize: "0.55rem", color: "#444", letterSpacing: "0.05em", marginBottom: "1.5rem", fontFamily: "monospace" }}>
+            storage: IndexedDB · {saveState}
+          </div>
+
+          {history.length === 0 ? (
+            <div style={{ textAlign: "center", color: "#444", fontSize: "0.8rem", marginTop: "3rem", letterSpacing: "0.1em" }}>
+              No sessions yet.<br />Complete a round to see history.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.5rem" }}>
+              {history.map(e => (
+                <div key={e.id} style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  padding: "0.75rem 1rem", background: "#111", border: "1px solid #1e1e1e", borderRadius: 6,
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+                    <div style={{ fontSize: "1.1rem", fontWeight: 700, letterSpacing: "-0.02em" }}>
+                      <span style={{ color: "#c8b97a" }}>{e.from}</span>
+                      <span style={{ color: "#444", margin: "0 4px" }}>→</span>
+                      <span style={{ color: "#c8b97a" }}>{e.to}</span>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: "1rem", fontWeight: 700 }}>{e.count}</div>
+                      <div style={{ fontSize: "0.6rem", color: "#555", letterSpacing: "0.15em" }}>CHANGES</div>
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: "1rem" }}>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: "0.65rem", color: "#555" }}>
+                        {new Date(e.date).toLocaleDateString(undefined, { month: "short", day: "numeric" })}
+                      </div>
+                      <div style={{ fontSize: "0.6rem", color: "#444" }}>
+                        {new Date(e.date).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+                      </div>
+                    </div>
+                    <button onClick={() => deleteEntry(e.id)} style={{
+                      background: "none", border: "none", color: "#333", cursor: "pointer", fontSize: "0.9rem", padding: "4px",
+                    }}>✕</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ChordPicker({ label, value, onChange, disabled }) {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+      <div style={{ fontSize: "0.6rem", letterSpacing: "0.25em", color: "#666", textTransform: "uppercase" }}>{label}</div>
+      <select value={value} onChange={e => onChange(e.target.value)} disabled={disabled}
+        style={{
+          background: "#111", color: "#f0ece3", border: "1px solid #333", borderRadius: 6,
+          padding: "0.6rem 1rem", fontSize: "1.4rem", fontWeight: 700,
+          fontFamily: "'Courier New', monospace", cursor: disabled ? "default" : "pointer",
+          appearance: "none", textAlign: "center", width: 90, opacity: disabled ? 0.5 : 1,
+        }}>
+        {CHORDS.map(c => <option key={c} value={c}>{c}</option>)}
+      </select>
+    </div>
+  );
+}
+
+function btnStyle(bg, color) {
+  return {
+    width: "100%", padding: "0.9rem", background: bg, color, border: "none",
+    borderRadius: 6, fontSize: "0.75rem", fontWeight: 700, letterSpacing: "0.3em",
+    fontFamily: "'Courier New', monospace", cursor: "pointer", textTransform: "uppercase",
+    transition: "opacity 0.2s",
+  };
+}
+
+const CONFETTI_COLORS = ["#c8b97a", "#e05a5a", "#f0ece3", "#6ab0a0", "#d98c5f"];
+
+function CelebrationOverlay({ data, onClose }) {
+  const pieces = Array.from({ length: 80 }, (_, i) => ({
+    id: i, left: Math.random() * 100, delay: Math.random() * 0.6,
+    duration: 2 + Math.random() * 1.5, color: CONFETTI_COLORS[i % CONFETTI_COLORS.length],
+    size: 6 + Math.random() * 8, rotate: Math.random() * 360,
+  }));
+  return (
+    <div onClick={onClose} style={{
+      position: "fixed", inset: 0, zIndex: 100, background: "rgba(13,13,13,0.92)",
+      display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+      overflow: "hidden", cursor: "pointer",
+    }}>
+      <style>{`
+        @keyframes confettiFall { 0% { transform: translateY(-20vh) rotate(0deg); opacity: 1; } 100% { transform: translateY(110vh) rotate(720deg); opacity: 0.9; } }
+        @keyframes popIn { 0% { transform: scale(0.4); opacity: 0; } 60% { transform: scale(1.12); opacity: 1; } 100% { transform: scale(1); opacity: 1; } }
+      `}</style>
+      {pieces.map(p => (
+        <div key={p.id} style={{
+          position: "absolute", top: 0, left: `${p.left}%`, width: p.size, height: p.size * 0.4,
+          background: p.color, borderRadius: 2, transform: `rotate(${p.rotate}deg)`,
+          animation: `confettiFall ${p.duration}s ${p.delay}s ease-in forwards`,
+        }} />
+      ))}
+      <div style={{ textAlign: "center", animation: "popIn 0.5s ease-out", zIndex: 1, padding: "0 2rem" }}>
+        <div style={{ fontSize: "3rem", marginBottom: "0.5rem" }}>🎉</div>
+        <div style={{ fontSize: "0.7rem", letterSpacing: "0.4em", color: "#c8b97a", textTransform: "uppercase", marginBottom: "0.75rem" }}>New Record</div>
+        <div style={{ fontSize: "1.6rem", fontWeight: 700, marginBottom: "0.5rem", fontFamily: "'Courier New', monospace", color: "#f0ece3" }}>
+          <span style={{ color: "#c8b97a" }}>{data.from}</span>
+          <span style={{ color: "#555", margin: "0 8px" }}>→</span>
+          <span style={{ color: "#c8b97a" }}>{data.to}</span>
+        </div>
+        <div style={{ fontSize: "4rem", fontWeight: 700, lineHeight: 1, letterSpacing: "-0.05em", color: "#f0ece3", fontFamily: "'Courier New', monospace" }}>{data.count}</div>
+        <div style={{ fontSize: "0.65rem", color: "#888", letterSpacing: "0.2em", marginTop: "0.75rem" }}>BEAT YOUR OLD BEST OF {data.prev}</div>
+        <div style={{ fontSize: "0.6rem", color: "#444", letterSpacing: "0.2em", marginTop: "2rem" }}>TAP ANYWHERE TO CONTINUE</div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<ChordTracker />);
+</script>
+</body>
+</html>
+
